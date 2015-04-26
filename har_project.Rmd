@@ -1,0 +1,223 @@
+---
+title: "Practical Machine Learning Course Project"
+author: "Rashan Jibowu"
+date: "April 25, 2015"
+output:
+  html_document:
+    keep_md: yes
+---
+
+### Overview
+
+This report details my approach toward predicting the manner in which a person performed an exercise. Using data from the [Human Activity Recognition project](http://groupware.les.inf.puc-rio.br/har), below, I describe the process of building a predictive model that determines whether a person is doing an exercise correctly. 
+
+### Set up
+
+```{r setup}
+
+library(ggplot2)
+library(caret)
+library(foreach)
+library(data.table)
+library(parallel)
+library(doParallel)
+library(randomForest)
+
+# urls
+data.test.url <- c("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv")
+data.train.url <- c("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv")
+
+```
+
+#### Get and load data
+
+```{r get-load-data}
+
+# set to true if you always want to download the data regardless of whether it was already downloaded
+manual.download <- FALSE
+
+# download data if not already downloaded
+if (!file.exists("./data/training.csv") || !file.exists("./data/testing.csv") || manual.download) {
+    if (!file.exists("./data")) {
+        dir.create("./data")
+    }
+    download.file(data.train.url, destfile = "./data/training.csv", method = "curl")
+    download.file(data.test.url, destfile = "./data/testing.csv", method = "curl")
+}
+
+# load the data
+data.test <- read.csv("./data/testing.csv", na.strings = c("NA", "#DIV/0!", ""), colClasses = c("character"))
+
+data.train <- read.csv("./data/training.csv", na.strings = c("NA", "#DIV/0!", ""), colClasses = c("character"))
+
+```
+
+#### Clean up data  
+
+Since the data file came in a bit messy, let's do some clean up. I loaded the data in and treated all variables as strings. When coerced to the correct data types, NAs will surface appropriately
+
+```{r clean-data}
+
+# coerce data to correct data types
+classes <- c("int", "character", "int", "int", "character", "character", "int", rep("num", times = 152), "character")
+
+convertToClasses <- function(df, classes) {
+    for (i in 1:ncol(df)) {
+
+        if (classes[i] == "num") {
+            df[,i] <- as.numeric(df[,i])
+        }
+
+        if (classes[i] == "int") {
+            df[,i] <- as.integer(df[,i])
+        }
+
+        if (classes[i] == "character") {
+            df[,i] <- as.character(df[,i])
+        }
+    }
+    
+    # return the cleaned data frame
+    df
+}
+
+data.train <- convertToClasses(data.train, classes)
+data.test <- convertToClasses(data.test, classes)
+
+```
+
+#### Remove irrelevant factors
+
+Some columns represent data that ought not to be considered for machine learning. They include timestamps (`raw_timestamp_part_1`, `raw_timestamp_part_2`, and `cvtd_timestamp`), `user_name`, the row number (`X`), and window data (`num_window` and `new_window`). If this metadata were included in a final model, it would significantly reduce the overall robustness of the model to deal with new cases.
+
+```{r irrelevance}
+
+# remove irrelevant factors
+irrelevant <- grep("*timestamp*|^user_name|^X$|*window*", colnames(data.train))
+data.train <- data.train[,-irrelevant]
+
+```
+
+### Selecting Features
+
+Many variables have (lots of) missing values. The absence of information in these variables make them unhelpful. As a result, let's remove those. 
+
+Of the remaining variables, let's retain those variables that are related to belt, arm, forearm and dumbbell measurements.
+
+```{r selecting-features}
+
+unhelpful <- sapply(data.train, function (x) any(is.na(x) | x == ""))
+relevant <- grepl("belt|(^fore)*arm|dumbbell", colnames(data.train))
+predictors <- colnames(data.train[,(!unhelpful & relevant)])
+
+data.train <- data.train[,c(predictors, "classe")]
+
+```
+
+Before training the model, let's ensure that our target variable is a categorical variable.
+
+```{r factorize-target}
+
+data.train$classe <- as.factor(data.train$classe)
+
+```
+
+### Cross validation
+
+Below, I cross-validate the data by using 70% of the training data to train the model and the remainder to validate the quality of the model. If performant, I'll use this model to make predictions on the testing data.
+
+```{r cross-validate}
+
+inTrain <- createDataPartition(data.train$classe, p = 0.7, list = FALSE)
+data.train.subtrain <- data.train[inTrain,]
+data.train.test <- data.train[-inTrain,]
+
+```
+
+### Preprocess the data
+
+Since there are so many potential predictor variables (n = 52) and since the vast majority of them are numeric, the dataset would benefit from preprocessing the data so that the data are centered and scaled, enabling better predictions.
+
+```{r preprocess}
+
+# center and scale data - exclude the target (col 53)
+preProc <- preProcess(data.train.subtrain[,c(1:52)], center = TRUE, scale = TRUE)
+preProc
+
+```
+
+### Attempt to parallelize
+
+Since the data set is large, the training process may take awhile to complete. To potentially speed up the process, let's attempt to use multiple computing cores to process data in parallel.
+
+```{r parallelize}
+
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+
+```
+
+### Train model
+
+Let's train the model on the subtrain data.
+
+```{r train-model}
+
+set.seed(12345)
+trControl <- trainControl(classProbs = TRUE, 
+                          savePredictions = TRUE, 
+                          allowParallel=TRUE)
+
+trainingModel <- train(classe ~ ., data = data.train.subtrain, method = "rf")
+
+```
+
+### Measuring Quality of Model
+
+#### Evaluating on subtrain data
+
+```{r evaluate-subtrain}
+
+data.train.subtrain.predictions <- predict(trainingModel, data.train.subtrain)
+confusionMatrix(data.train.subtrain.predictions, data.train.subtrain$classe)
+
+```
+
+Based on the analysis above, the "in-sample" error rate is 0%. Despite the high accuracy, there will likely be some error for the cross-validating testing dataset and the external testing dataset to be a little greater. Let's set expectations to be between 1% and 2%.
+
+### Evaluation on cross-validating testing data
+
+```{r evaluate-testtrain}
+
+data.train.test.predictions <- predict(trainingModel, data.train.test)
+confusionMatrix(data.train.test.predictions, data.train.test$classe)
+
+```
+
+#### Estimating out-of-sample error
+
+The above analysis shows an _intermediate_ "out-of-sample" error of just under 1% for the cross-validating test dataset. Based on this, I would expect the true "out-of-sample" error on the external testing data set to be around 1.5%-2.0%.
+
+### Final Model
+
+```{r final-model}
+
+trainingModel$finalModel
+
+```
+
+Below are the variables that were most important to this model.
+
+```{r variable-importance}
+
+varImp(trainingModel)
+
+```
+
+Save the final model for evaluation against the test data.
+
+```{r save-final-model}
+
+save(trainingModel, file="trainingModel.RData")
+
+```
