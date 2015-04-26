@@ -1,3 +1,6 @@
 # data files
 data/
 *.Rdata
+
+# answers to programmatic submission
+submission/problem_id*
